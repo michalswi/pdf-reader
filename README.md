@@ -19,8 +19,12 @@ go-cli tool to extract text from **PDF** files and save it to a **text** file
 ## \# installation
 
 ```bash
-make build-mac
-make build-linux
+make build
+
+or
+
+make build-mac      # [rename file after creation]
+make build-linux    # [rename file after creation] 
 ```
 
 ## \# options
