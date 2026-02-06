@@ -13,7 +13,8 @@ import (
 	"unicode"
 )
 
-// Reader represents a PDF file reader
+// Reader represents a PDF file reader.
+// Provides methods to extract text and get page information.
 type Reader struct {
 	file    *os.File
 	size    int64
@@ -21,7 +22,8 @@ type Reader struct {
 	pages   []map[string]interface{}
 }
 
-// Open opens a PDF file for reading
+// Open opens a PDF file and returns a Reader.
+// Returns the file handle (must be closed by caller), a Reader, and any error.
 func Open(filename string) (*os.File, *Reader, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -65,7 +67,7 @@ func (r *Reader) parse() error {
 	return nil
 }
 
-// NumPage returns the number of pages
+// NumPage returns the number of pages in the PDF.
 func (r *Reader) NumPage() int {
 	// Read entire file to count pages
 	data := make([]byte, r.size)
@@ -84,7 +86,7 @@ func (r *Reader) Page(num int) Page {
 	return Page{reader: r, number: num}
 }
 
-// GetPlainText extracts all text from the PDF
+// GetPlainText extracts all text from the PDF and returns it as an io.Reader.
 func (r *Reader) GetPlainText() (io.Reader, error) {
 	var result bytes.Buffer
 
