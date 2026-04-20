@@ -1,7 +1,7 @@
 GOLANG_VERSION := 1.25.5
 
 APP_NAME := pdf-reader
-APP_VERSION := 1.0.0
+APP_VERSION := 1.1.0
 
 .DEFAULT_GOAL := help
 .PHONY: build build-mac build-linux
