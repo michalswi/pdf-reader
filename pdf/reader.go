@@ -135,6 +135,19 @@ func (r *Reader) extractTextFromData(data []byte) string {
 
 		streamData := data[streamStartPos : streamStartPos+endIdx]
 
+		// Skip non-text streams: look back at the preceding bytes to find the
+		// stream dictionary and skip image data and font programs.
+		dictLookbackStart := pos + idx - 200
+		if dictLookbackStart < 0 {
+			dictLookbackStart = 0
+		}
+		preceding := string(data[dictLookbackStart : pos+idx])
+		nonContentDict := regexp.MustCompile(`/Subtype\s*/Image|/Type\s*/Font|/Subtype\s*/CIDFontType|BitsPerComponent`)
+		if nonContentDict.MatchString(preceding) {
+			pos = streamStartPos + endIdx + len(streamEnd)
+			continue
+		}
+
 		// Try to decompress if it's a FlateDecode stream
 		decompressed := r.tryDecompress(streamData)
 
@@ -164,7 +177,10 @@ func (r *Reader) tryDecompress(data []byte) []byte {
 
 	decompressed, err := io.ReadAll(zr)
 	if err != nil {
-		return data
+		if len(decompressed) < 20 {
+			return data
+		}
+		return decompressed
 	}
 
 	return decompressed
@@ -172,57 +188,145 @@ func (r *Reader) tryDecompress(data []byte) []byte {
 
 // extractTextFromStream extracts text from a content stream
 func (r *Reader) extractTextFromStream(data []byte) string {
-	var result strings.Builder
 	content := string(data)
 
-	// Extract hex strings: <48656C6C6F>
-	hexPattern := regexp.MustCompile(`<([0-9A-Fa-f]+)>\s*(?:Tj|TJ)`)
-	hexMatches := hexPattern.FindAllStringSubmatch(content, -1)
-	for _, match := range hexMatches {
-		if len(match) > 1 {
-			decoded := decodeHexString(match[1])
-			if decoded != "" {
-				result.WriteString(decoded)
-				result.WriteString(" ")
-			}
-		}
+	// Only process streams that contain PDF text objects (BT...ET blocks).
+	// Font programs, ICC profiles, images, and other binary streams never
+	// contain valid BT/ET sequences with text operators.
+	btBlockPattern := regexp.MustCompile(`(?s)\bBT\b(.*?)\bET\b`)
+	btBlocks := btBlockPattern.FindAllStringSubmatch(content, -1)
+	if len(btBlocks) == 0 {
+		return ""
 	}
 
-	// Extract literal strings: (text) followed by text operators
-	literalPattern := regexp.MustCompile(`\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*(?:Tj|TJ|'|")`)
-	literalMatches := literalPattern.FindAllStringSubmatch(content, -1)
-	for _, match := range literalMatches {
-		if len(match) > 1 {
-			decoded := decodeLiteralString(match[1])
-			// Only include if it's mostly printable ASCII
-			if isPrintableText(decoded) {
-				result.WriteString(decoded)
-				result.WriteString(" ")
-			}
-		}
-	}
+	// Split each BT/ET block on text-positioning operators. Every Td/TD/Tm/T*
+	// moves the cursor to a new position (typically a new word or line), so
+	// the text from consecutive segments should be separated by a space.
+	posOpPattern := regexp.MustCompile(`\s(?:Td|TD|Tm|T\*)(?:\s|$)`)
 
-	// Extract array strings: [(text1)(text2)]TJ
-	arrayPattern := regexp.MustCompile(`\[((?:[^][]|\([^)]*\))*)\]\s*TJ`)
-	arrayMatches := arrayPattern.FindAllStringSubmatch(content, -1)
-	for _, match := range arrayMatches {
-		if len(match) > 1 {
-			arrayContent := match[1]
-			stringPattern := regexp.MustCompile(`\(([^)\\]*(?:\\.[^)\\]*)*)\)`)
-			strings := stringPattern.FindAllStringSubmatch(arrayContent, -1)
-			for _, str := range strings {
-				if len(str) > 1 {
-					decoded := decodeLiteralString(str[1])
-					if isPrintableText(decoded) {
-						result.WriteString(decoded)
+	// Matches all text-showing operators within a segment, in document order.
+	combinedPattern := regexp.MustCompile(
+		`<([0-9A-Fa-f]+)>\s*(?:Tj|TJ)` +
+			`|\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*(?:Tj|TJ|'|")` +
+			`|\[((?:[^][]|\([^)]*\))*)\]\s*TJ`,
+	)
+
+	var result strings.Builder
+	for _, block := range btBlocks {
+		if len(block) < 2 {
+			continue
+		}
+
+		// Each segment between positioning operators contributes a word/phrase.
+		segments := posOpPattern.Split(block[1], -1)
+		for _, segment := range segments {
+			var segText strings.Builder
+			matches := combinedPattern.FindAllStringSubmatch(segment, -1)
+			for _, match := range matches {
+				switch {
+				case match[1] != "": // hex string: <hex> Tj|TJ
+					decoded := decodeHexString(match[1])
+					if decoded != "" {
+						segText.WriteString(decoded)
 					}
+				case match[2] != "": // literal string: (text) Tj|TJ|'|"
+					decoded := decodeLiteralString(match[2])
+					if isPrintableText(decoded) {
+						segText.WriteString(decoded)
+					}
+				case match[3] != "": // array: [...] TJ
+					segText.WriteString(processTJArray(match[3]))
 				}
 			}
-			result.WriteString(" ")
+			text := strings.TrimSpace(segText.String())
+			if text != "" {
+				if result.Len() > 0 {
+					result.WriteString(" ")
+				}
+				result.WriteString(text)
+			}
 		}
+		result.WriteString("\n")
 	}
 
 	return cleanText(result.String())
+}
+
+// processTJArray extracts text from a PDF TJ array content string.
+// It inserts a space whenever a kerning adjustment < -100 text units is
+// encountered — the PDF convention for encoding an inter-word gap.
+func processTJArray(content string) string {
+	var result strings.Builder
+	i := 0
+	n := len(content)
+	for i < n {
+		ch := content[i]
+		switch {
+		case ch == '(':
+			end, decoded := scanLiteralString(content, i)
+			if isPrintableText(decoded) {
+				result.WriteString(decoded)
+			}
+			i = end
+		case ch == '<':
+			close := strings.Index(content[i+1:], ">")
+			if close == -1 {
+				i++
+				continue
+			}
+			hexStr := content[i+1 : i+1+close]
+			decoded := decodeHexString(hexStr)
+			if decoded != "" {
+				result.WriteString(decoded)
+			}
+			i = i + 1 + close + 1
+		case ch == '-' || (ch >= '0' && ch <= '9'):
+			end := i + 1
+			for end < n && (content[end] >= '0' && content[end] <= '9' || content[end] == '.') {
+				end++
+			}
+			if val, err := strconv.ParseFloat(content[i:end], 64); err == nil && val < -100 {
+				result.WriteString(" ")
+			}
+			i = end
+		default:
+			i++
+		}
+	}
+	return result.String()
+}
+
+// scanLiteralString scans a PDF literal string starting at '(' (handling nested
+// parens and backslash escapes) and returns (position after closing ')', decoded text).
+func scanLiteralString(s string, pos int) (int, string) {
+	if pos >= len(s) || s[pos] != '(' {
+		return pos + 1, ""
+	}
+	i := pos + 1
+	depth := 1
+	var raw strings.Builder
+	for i < len(s) && depth > 0 {
+		ch := s[i]
+		if ch == '\\' && i+1 < len(s) {
+			raw.WriteByte(ch)
+			raw.WriteByte(s[i+1])
+			i += 2
+		} else if ch == '(' {
+			depth++
+			raw.WriteByte(ch)
+			i++
+		} else if ch == ')' {
+			depth--
+			if depth > 0 {
+				raw.WriteByte(ch)
+			}
+			i++
+		} else {
+			raw.WriteByte(ch)
+			i++
+		}
+	}
+	return i, decodeLiteralString(raw.String())
 }
 
 // isPrintableText checks if a string is mostly readable text
@@ -231,13 +335,11 @@ func isPrintableText(s string) bool {
 		return false
 	}
 
-	// Check if string contains mostly ASCII letters, numbers, spaces, and common punctuation
 	asciiCount := 0
 	totalCount := 0
 
 	for _, r := range s {
 		totalCount++
-		// Count letters, numbers, spaces, and common punctuation
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
 			(r >= '0' && r <= '9') || r == ' ' || r == '.' ||
 			r == ',' || r == '!' || r == '?' || r == '\'' ||
@@ -247,17 +349,7 @@ func isPrintableText(s string) bool {
 		}
 	}
 
-	// Require at least 90% standard ASCII characters
-	// and the string must contain at least one letter
-	hasLetter := false
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-			hasLetter = true
-			break
-		}
-	}
-
-	return hasLetter && float64(asciiCount)/float64(totalCount) >= 0.9
+	return float64(asciiCount)/float64(totalCount) >= 0.6
 }
 
 // decodeHexString decodes a PDF hex string
@@ -362,97 +454,15 @@ func filterPrintable(s string) string {
 
 // cleanText cleans up extracted text
 func cleanText(s string) string {
-	// First, add spaces between likely word boundaries (capital letters, numbers)
-	var spaced strings.Builder
-	for i, r := range s {
-		if i > 0 {
-			prev := rune(s[i-1])
-			// Add space before capital letter if previous was lowercase
-			if unicode.IsUpper(r) && unicode.IsLower(prev) {
-				spaced.WriteString(" ")
-			}
-			// Add space between letter and number or number and letter
-			if (unicode.IsLetter(r) && unicode.IsDigit(prev)) ||
-				(unicode.IsDigit(r) && unicode.IsLetter(prev)) {
-				spaced.WriteString(" ")
-			}
-		}
-		spaced.WriteRune(r)
-	}
-
-	// Split into lines and filter
-	lines := strings.Split(spaced.String(), "\n")
+	lines := strings.Split(s, "\n")
 	var cleaned []string
-
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		// Skip empty lines or lines with very few characters
-		if len(line) < 10 {
-			continue
-		}
-
-		// Count readable words (sequences of 3+ letters)
-		wordPattern := regexp.MustCompile(`[a-zA-Z]{3,}`)
-		words := wordPattern.FindAllString(line, -1)
-
-		// Skip lines without at least 2 real words
-		if len(words) < 2 {
-			continue
-		}
-
-		// Skip lines where readable words make up less than 60% of the content
-		totalWordChars := 0
-		for _, w := range words {
-			totalWordChars += len(w)
-		}
-		if float64(totalWordChars)/float64(len(line)) < 0.6 {
-			continue
-		}
-
-		// Additional check: skip lines with too many single characters or numbers
-		singleChars := regexp.MustCompile(`\b[A-Z0-9]\b`).FindAllString(line, -1)
-		if len(singleChars) > len(words)/2 {
-			continue
-		}
-
-		cleaned = append(cleaned, line)
-	}
-
-	// Join with newlines and clean up excessive spacing
-	result := strings.Join(cleaned, "\n")
-	result = regexp.MustCompile(`\s+`).ReplaceAllString(result, " ")
-	result = strings.TrimSpace(result)
-
-	// Add back newlines for better readability (every ~80 chars or at sentence end)
-	words := strings.Fields(result)
-	var formatted strings.Builder
-	lineLen := 0
-
-	for i, word := range words {
-		if lineLen > 0 && lineLen+len(word)+1 > 80 {
-			formatted.WriteString("\n")
-			lineLen = 0
-		}
-
-		if lineLen > 0 {
-			formatted.WriteString(" ")
-			lineLen++
-		}
-
-		formatted.WriteString(word)
-		lineLen += len(word)
-
-		// Add newline after sentence-ending punctuation
-		if i < len(words)-1 && len(word) > 0 {
-			lastChar := word[len(word)-1]
-			if lastChar == '.' || lastChar == '!' || lastChar == '?' {
-				formatted.WriteString("\n")
-				lineLen = 0
-			}
+		if line != "" {
+			cleaned = append(cleaned, line)
 		}
 	}
-
-	return formatted.String()
+	return strings.TrimSpace(strings.Join(cleaned, "\n"))
 }
 
 // Page represents a PDF page
