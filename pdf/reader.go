@@ -199,54 +199,134 @@ func (r *Reader) extractTextFromStream(data []byte) string {
 		return ""
 	}
 
-	// Combined pattern matching all text-showing operators in document order:
-	// 1. Hex strings:     <hexdata> Tj|TJ
-	// 2. Literal strings: (text) Tj|TJ|'|"
-	// 3. Array TJ:        [(strings...)] TJ
+	// Split each BT/ET block on text-positioning operators. Every Td/TD/Tm/T*
+	// moves the cursor to a new position (typically a new word or line), so
+	// the text from consecutive segments should be separated by a space.
+	posOpPattern := regexp.MustCompile(`\s(?:Td|TD|Tm|T\*)(?:\s|$)`)
+
+	// Matches all text-showing operators within a segment, in document order.
 	combinedPattern := regexp.MustCompile(
 		`<([0-9A-Fa-f]+)>\s*(?:Tj|TJ)` +
 			`|\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*(?:Tj|TJ|'|")` +
 			`|\[((?:[^][]|\([^)]*\))*)\]\s*TJ`,
 	)
-	innerStringPattern := regexp.MustCompile(`\(([^)\\]*(?:\\.[^)\\]*)*)\)`)
 
 	var result strings.Builder
 	for _, block := range btBlocks {
 		if len(block) < 2 {
 			continue
 		}
-		matches := combinedPattern.FindAllStringSubmatch(block[1], -1)
-		for _, match := range matches {
-			switch {
-			case match[1] != "": // hex string
-				decoded := decodeHexString(match[1])
-				if decoded != "" {
-					result.WriteString(decoded)
-					result.WriteString(" ")
-				}
-			case match[2] != "": // literal string
-				decoded := decodeLiteralString(match[2])
-				if isPrintableText(decoded) {
-					result.WriteString(decoded)
-					result.WriteString(" ")
-				}
-			case match[3] != "": // array TJ
-				strs := innerStringPattern.FindAllStringSubmatch(match[3], -1)
-				for _, str := range strs {
-					if len(str) > 1 {
-						decoded := decodeLiteralString(str[1])
-						if isPrintableText(decoded) {
-							result.WriteString(decoded)
-						}
+
+		// Each segment between positioning operators contributes a word/phrase.
+		segments := posOpPattern.Split(block[1], -1)
+		for _, segment := range segments {
+			var segText strings.Builder
+			matches := combinedPattern.FindAllStringSubmatch(segment, -1)
+			for _, match := range matches {
+				switch {
+				case match[1] != "": // hex string: <hex> Tj|TJ
+					decoded := decodeHexString(match[1])
+					if decoded != "" {
+						segText.WriteString(decoded)
 					}
+				case match[2] != "": // literal string: (text) Tj|TJ|'|"
+					decoded := decodeLiteralString(match[2])
+					if isPrintableText(decoded) {
+						segText.WriteString(decoded)
+					}
+				case match[3] != "": // array: [...] TJ
+					segText.WriteString(processTJArray(match[3]))
 				}
-				result.WriteString(" ")
+			}
+			text := strings.TrimSpace(segText.String())
+			if text != "" {
+				if result.Len() > 0 {
+					result.WriteString(" ")
+				}
+				result.WriteString(text)
 			}
 		}
 		result.WriteString("\n")
 	}
 
 	return cleanText(result.String())
+}
+
+// processTJArray extracts text from a PDF TJ array content string.
+// It inserts a space whenever a kerning adjustment < -100 text units is
+// encountered — the PDF convention for encoding an inter-word gap.
+func processTJArray(content string) string {
+	var result strings.Builder
+	i := 0
+	n := len(content)
+	for i < n {
+		ch := content[i]
+		switch {
+		case ch == '(':
+			end, decoded := scanLiteralString(content, i)
+			if isPrintableText(decoded) {
+				result.WriteString(decoded)
+			}
+			i = end
+		case ch == '<':
+			close := strings.Index(content[i+1:], ">")
+			if close == -1 {
+				i++
+				continue
+			}
+			hexStr := content[i+1 : i+1+close]
+			decoded := decodeHexString(hexStr)
+			if decoded != "" {
+				result.WriteString(decoded)
+			}
+			i = i + 1 + close + 1
+		case ch == '-' || (ch >= '0' && ch <= '9'):
+			end := i + 1
+			for end < n && (content[end] >= '0' && content[end] <= '9' || content[end] == '.') {
+				end++
+			}
+			if val, err := strconv.ParseFloat(content[i:end], 64); err == nil && val < -100 {
+				result.WriteString(" ")
+			}
+			i = end
+		default:
+			i++
+		}
+	}
+	return result.String()
+}
+
+// scanLiteralString scans a PDF literal string starting at '(' (handling nested
+// parens and backslash escapes) and returns (position after closing ')', decoded text).
+func scanLiteralString(s string, pos int) (int, string) {
+	if pos >= len(s) || s[pos] != '(' {
+		return pos + 1, ""
+	}
+	i := pos + 1
+	depth := 1
+	var raw strings.Builder
+	for i < len(s) && depth > 0 {
+		ch := s[i]
+		if ch == '\\' && i+1 < len(s) {
+			raw.WriteByte(ch)
+			raw.WriteByte(s[i+1])
+			i += 2
+		} else if ch == '(' {
+			depth++
+			raw.WriteByte(ch)
+			i++
+		} else if ch == ')' {
+			depth--
+			if depth > 0 {
+				raw.WriteByte(ch)
+			}
+			i++
+		} else {
+			raw.WriteByte(ch)
+			i++
+		}
+	}
+	return i, decodeLiteralString(raw.String())
 }
 
 // isPrintableText checks if a string is mostly readable text
