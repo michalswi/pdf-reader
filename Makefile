@@ -19,10 +19,10 @@ build-mac: ## build binary for macOS (arm64)
 	CGO_ENABLED=0 go build -a \
 	-ldflags "-s -w -X 'main.Version=$(APP_VERSION)'" \
 	-o $(APP_NAME)_macos_arm64
-	sha256sum $(APP_NAME) > $(APP_NAME)_macos_arm64.sha256
+	sha256sum $(APP_NAME)_macos_arm64 > $(APP_NAME)_macos_arm64.sha256
 
 build-linux: ## build binary for Linux (amd64)
 	GOOS=linux GOARCH=amd64 go build -a \
 	-ldflags "-s -w -X 'main.Version=$(APP_VERSION)'" \
 	-o $(APP_NAME)_linux_amd64
-	sha256sum $(APP_NAME) > $(APP_NAME)_linux_amd64.sha256
+	sha256sum $(APP_NAME)_linux_amd64 > $(APP_NAME)_linux_amd64.sha256

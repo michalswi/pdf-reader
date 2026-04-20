@@ -142,10 +142,8 @@ func (r *Reader) extractTextFromData(data []byte) string {
 			dictLookbackStart = 0
 		}
 		preceding := string(data[dictLookbackStart : pos+idx])
-		if strings.Contains(preceding, "/Subtype /Image") ||
-			strings.Contains(preceding, "/Type /Font") ||
-			strings.Contains(preceding, "/Subtype /CIDFontType") ||
-			strings.Contains(preceding, "BitsPerComponent") {
+		nonContentDict := regexp.MustCompile(`/Subtype\s*/Image|/Type\s*/Font|/Subtype\s*/CIDFontType|BitsPerComponent`)
+		if nonContentDict.MatchString(preceding) {
 			pos = streamStartPos + endIdx + len(streamEnd)
 			continue
 		}
@@ -190,10 +188,18 @@ func (r *Reader) tryDecompress(data []byte) []byte {
 
 // extractTextFromStream extracts text from a content stream
 func (r *Reader) extractTextFromStream(data []byte) string {
-	var result strings.Builder
 	content := string(data)
 
-	// Single combined pattern to match all text-showing operators in document order:
+	// Only process streams that contain PDF text objects (BT...ET blocks).
+	// Font programs, ICC profiles, images, and other binary streams never
+	// contain valid BT/ET sequences with text operators.
+	btBlockPattern := regexp.MustCompile(`(?s)\bBT\b(.*?)\bET\b`)
+	btBlocks := btBlockPattern.FindAllStringSubmatch(content, -1)
+	if len(btBlocks) == 0 {
+		return ""
+	}
+
+	// Combined pattern matching all text-showing operators in document order:
 	// 1. Hex strings:     <hexdata> Tj|TJ
 	// 2. Literal strings: (text) Tj|TJ|'|"
 	// 3. Array TJ:        [(strings...)] TJ
@@ -204,33 +210,40 @@ func (r *Reader) extractTextFromStream(data []byte) string {
 	)
 	innerStringPattern := regexp.MustCompile(`\(([^)\\]*(?:\\.[^)\\]*)*)\)`)
 
-	matches := combinedPattern.FindAllStringSubmatch(content, -1)
-	for _, match := range matches {
-		switch {
-		case match[1] != "": // hex string
-			decoded := decodeHexString(match[1])
-			if decoded != "" {
-				result.WriteString(decoded)
-				result.WriteString(" ")
-			}
-		case match[2] != "": // literal string
-			decoded := decodeLiteralString(match[2])
-			if isPrintableText(decoded) {
-				result.WriteString(decoded)
-				result.WriteString(" ")
-			}
-		case match[3] != "": // array TJ
-			strs := innerStringPattern.FindAllStringSubmatch(match[3], -1)
-			for _, str := range strs {
-				if len(str) > 1 {
-					decoded := decodeLiteralString(str[1])
-					if isPrintableText(decoded) {
-						result.WriteString(decoded)
+	var result strings.Builder
+	for _, block := range btBlocks {
+		if len(block) < 2 {
+			continue
+		}
+		matches := combinedPattern.FindAllStringSubmatch(block[1], -1)
+		for _, match := range matches {
+			switch {
+			case match[1] != "": // hex string
+				decoded := decodeHexString(match[1])
+				if decoded != "" {
+					result.WriteString(decoded)
+					result.WriteString(" ")
+				}
+			case match[2] != "": // literal string
+				decoded := decodeLiteralString(match[2])
+				if isPrintableText(decoded) {
+					result.WriteString(decoded)
+					result.WriteString(" ")
+				}
+			case match[3] != "": // array TJ
+				strs := innerStringPattern.FindAllStringSubmatch(match[3], -1)
+				for _, str := range strs {
+					if len(str) > 1 {
+						decoded := decodeLiteralString(str[1])
+						if isPrintableText(decoded) {
+							result.WriteString(decoded)
+						}
 					}
 				}
+				result.WriteString(" ")
 			}
-			result.WriteString(" ")
 		}
+		result.WriteString("\n")
 	}
 
 	return cleanText(result.String())
