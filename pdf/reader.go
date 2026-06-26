@@ -506,16 +506,19 @@ func (r *Reader) extractTextFromStream(data []byte) string {
 	var ctmStack []matrix
 
 	// Text state — persists across BT/ET blocks within the same stream.
+	// tm tracks the full 6-component text matrix so that Td is applied
+	// correctly through the matrix orientation (important when d ≠ 1).
 	inText := false
 	var activeCmap map[uint32]string
 	var fontSize float64 = 12
-	var curX, curY float64
+	var tm = matrix{1, 0, 0, 1, 0, 0} // text matrix
 
 	addRun := func(text string) {
 		if text == "" {
 			return
 		}
-		px, py := applyMatrix(ctm, curX, curY)
+		// Text origin in device space = CTM applied to (tm[4], tm[5]).
+		px, py := applyMatrix(ctm, tm[4], tm[5])
 		effSz := fontSize * math.Abs(ctm[0])
 		if effSz == 0 {
 			effSz = fontSize
@@ -544,7 +547,7 @@ func (r *Reader) extractTextFromStream(data []byte) string {
 			}
 		case "BT":
 			inText = true
-			curX, curY = 0, 0
+			tm = matrix{1, 0, 0, 1, 0, 0} // PDF spec: BT resets Tm and Tlm to identity
 		case "ET":
 			inText = false
 		case "Tf":
@@ -556,25 +559,29 @@ func (r *Reader) extractTextFromStream(data []byte) string {
 				activeCmap = r.fontCmaps[strings.TrimPrefix(tokens[i-2], "/")]
 			}
 		case "Tm":
-			// a b c d e f Tm — set text matrix; (e,f) is the position.
+			// a b c d e f Tm — set text matrix (all 6 components).
 			if inText && i >= 6 {
-				ex, _ := strconv.ParseFloat(tokens[i-2], 64)
-				ey, _ := strconv.ParseFloat(tokens[i-1], 64)
-				curX, curY = ex, ey
+				for k := 0; k < 6; k++ {
+					tm[k], _ = strconv.ParseFloat(tokens[i-6+k], 64)
+				}
 			}
 		case "Td", "TD":
-			// tx ty Td — move text cursor relative to current position.
+			// tx ty Td — pre-multiply Tlm by Translation(tx,ty).
+			// New e = tx*tm[0] + ty*tm[2] + tm[4]
+			// New f = tx*tm[1] + ty*tm[3] + tm[5]
 			if inText && i >= 2 {
 				tx, _ := strconv.ParseFloat(tokens[i-2], 64)
 				ty, _ := strconv.ParseFloat(tokens[i-1], 64)
-				curX += tx
-				curY += ty
+				e := tx*tm[0] + ty*tm[2] + tm[4]
+				f := tx*tm[1] + ty*tm[3] + tm[5]
+				tm[4], tm[5] = e, f
 			}
 		case "T*":
-			// Move to start of next line.
+			// Equivalent to 0 -leading Td (approximate leading as fontSize).
 			if inText {
-				curY -= fontSize
-				curX = 0
+				ty := -fontSize
+				tm[4] = ty*tm[2] + tm[4]
+				tm[5] = ty*tm[3] + tm[5]
 			}
 		case "Tj":
 			// string Tj — show text string.
@@ -593,7 +600,9 @@ func (r *Reader) extractTextFromStream(data []byte) string {
 		case "'":
 			// string ' — move to next line and show text.
 			if inText {
-				curY -= fontSize
+				ty := -fontSize
+				tm[4] = ty*tm[2] + tm[4]
+				tm[5] = ty*tm[3] + tm[5]
 				if i >= 1 {
 					addRun(r.decodeToken(tokens[i-1], activeCmap))
 				}
