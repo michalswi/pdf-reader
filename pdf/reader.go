@@ -464,6 +464,27 @@ func (r *Reader) extractTextFromData(data []byte) string {
 	return result.String()
 }
 
+// matrix represents a PDF 2D transformation matrix [a b c d e f] in row-vector
+// convention: x' = a*x + c*y + e,  y' = b*x + d*y + f.
+type matrix [6]float64
+
+// matMul concatenates two PDF matrices: result = m1 × m2.
+func matMul(m1, m2 matrix) matrix {
+	return matrix{
+		m1[0]*m2[0] + m1[1]*m2[2],
+		m1[0]*m2[1] + m1[1]*m2[3],
+		m1[2]*m2[0] + m1[3]*m2[2],
+		m1[2]*m2[1] + m1[3]*m2[3],
+		m1[4]*m2[0] + m1[5]*m2[2] + m2[4],
+		m1[4]*m2[1] + m1[5]*m2[3] + m2[5],
+	}
+}
+
+// applyMatrix transforms (x, y) through m into device coordinates.
+func applyMatrix(m matrix, x, y float64) (float64, float64) {
+	return m[0]*x + m[2]*y + m[4], m[1]*x + m[3]*y + m[5]
+}
+
 // textRun is a positioned piece of decoded text from a content stream.
 type textRun struct {
 	x, y, sz float64
@@ -471,87 +492,110 @@ type textRun struct {
 }
 
 // extractTextFromStream processes a PDF content stream token by token,
-// tracking font and position state so that each glyph is decoded with
-// the correct ToUnicode CMap and positioned accurately.
-// Collected runs are then assembled into readable text by assembleRuns.
+// tracking the CTM (via q/Q/cm) and text state (font, position) so that each
+// glyph is decoded with the correct ToUnicode CMap and positioned in device
+// space for correct reading-order assembly.
 func (r *Reader) extractTextFromStream(data []byte) string {
-	content := string(data)
-
-	btBlockRE := regexp.MustCompile(`(?s)\bBT\b(.*?)\bET\b`)
-	blocks := btBlockRE.FindAllStringSubmatch(content, -1)
-	if len(blocks) == 0 {
-		return ""
-	}
+	tokens := tokenizePDF(string(data))
+	n := len(tokens)
 
 	var runs []textRun
 
-	// State persists across BT/ET blocks within the same stream.
+	// Graphics state: current transformation matrix and save/restore stack.
+	ctm := matrix{1, 0, 0, 1, 0, 0}
+	var ctmStack []matrix
+
+	// Text state — persists across BT/ET blocks within the same stream.
+	inText := false
 	var activeCmap map[uint32]string
 	var fontSize float64 = 12
 	var curX, curY float64
 
-	for _, block := range blocks {
-		if len(block) < 2 {
-			continue
+	addRun := func(text string) {
+		if text == "" {
+			return
 		}
-		tokens := tokenizePDF(block[1])
-		n := len(tokens)
+		px, py := applyMatrix(ctm, curX, curY)
+		effSz := fontSize * math.Abs(ctm[0])
+		if effSz == 0 {
+			effSz = fontSize
+		}
+		runs = append(runs, textRun{x: px, y: py, sz: effSz, text: text})
+	}
 
-		for i := 0; i < n; i++ {
-			tok := tokens[i]
-			switch tok {
-			case "Tf":
-				// /FontName size Tf
-				if i >= 2 {
-					if sz, err := strconv.ParseFloat(tokens[i-1], 64); err == nil && sz > 0 {
-						fontSize = sz
-					}
-					activeCmap = r.fontCmaps[strings.TrimPrefix(tokens[i-2], "/")]
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
+		switch tok {
+		case "q":
+			ctmStack = append(ctmStack, ctm)
+		case "Q":
+			if len(ctmStack) > 0 {
+				ctm = ctmStack[len(ctmStack)-1]
+				ctmStack = ctmStack[:len(ctmStack)-1]
+			}
+		case "cm":
+			// a b c d e f cm — concatenate matrix with current CTM (pre-multiply).
+			if i >= 6 {
+				var m matrix
+				for k := 0; k < 6; k++ {
+					m[k], _ = strconv.ParseFloat(tokens[i-6+k], 64)
 				}
-			case "Tm":
-				// a b c d e f Tm  — set text matrix; (e,f) is the position
-				if i >= 6 {
-					ex, _ := strconv.ParseFloat(tokens[i-2], 64)
-					ey, _ := strconv.ParseFloat(tokens[i-1], 64)
-					curX, curY = ex, ey
+				ctm = matMul(m, ctm)
+			}
+		case "BT":
+			inText = true
+			curX, curY = 0, 0
+		case "ET":
+			inText = false
+		case "Tf":
+			// /FontName size Tf
+			if inText && i >= 2 {
+				if sz, err := strconv.ParseFloat(tokens[i-1], 64); err == nil && sz > 0 {
+					fontSize = sz
 				}
-			case "Td", "TD":
-				// tx ty Td — move text cursor relative to current position
-				if i >= 2 {
-					tx, _ := strconv.ParseFloat(tokens[i-2], 64)
-					ty, _ := strconv.ParseFloat(tokens[i-1], 64)
-					curX += tx
-					curY += ty
-				}
-			case "T*":
-				// Move to the start of the next line (approximate: one fontSize down).
+				activeCmap = r.fontCmaps[strings.TrimPrefix(tokens[i-2], "/")]
+			}
+		case "Tm":
+			// a b c d e f Tm — set text matrix; (e,f) is the position.
+			if inText && i >= 6 {
+				ex, _ := strconv.ParseFloat(tokens[i-2], 64)
+				ey, _ := strconv.ParseFloat(tokens[i-1], 64)
+				curX, curY = ex, ey
+			}
+		case "Td", "TD":
+			// tx ty Td — move text cursor relative to current position.
+			if inText && i >= 2 {
+				tx, _ := strconv.ParseFloat(tokens[i-2], 64)
+				ty, _ := strconv.ParseFloat(tokens[i-1], 64)
+				curX += tx
+				curY += ty
+			}
+		case "T*":
+			// Move to start of next line.
+			if inText {
 				curY -= fontSize
 				curX = 0
-			case "Tj":
-				// string Tj — show text string
-				if i >= 1 {
-					if text := r.decodeToken(tokens[i-1], activeCmap); text != "" {
-						runs = append(runs, textRun{x: curX, y: curY, sz: fontSize, text: text})
-					}
+			}
+		case "Tj":
+			// string Tj — show text string.
+			if inText && i >= 1 {
+				addRun(r.decodeToken(tokens[i-1], activeCmap))
+			}
+		case "TJ":
+			// array TJ — show text with individual glyph positioning.
+			if inText && i >= 1 {
+				arrTok := tokens[i-1]
+				if strings.HasPrefix(arrTok, "[") {
+					inner := arrTok[1 : len(arrTok)-1]
+					addRun(r.processTJArray(inner, activeCmap))
 				}
-			case "TJ":
-				// array TJ — show text with individual glyph positioning
-				if i >= 1 {
-					arrTok := tokens[i-1]
-					if strings.HasPrefix(arrTok, "[") {
-						inner := arrTok[1 : len(arrTok)-1]
-						if text := r.processTJArray(inner, activeCmap); text != "" {
-							runs = append(runs, textRun{x: curX, y: curY, sz: fontSize, text: text})
-						}
-					}
-				}
-			case "'":
-				// string ' — move to next line and show text
+			}
+		case "'":
+			// string ' — move to next line and show text.
+			if inText {
 				curY -= fontSize
 				if i >= 1 {
-					if text := r.decodeToken(tokens[i-1], activeCmap); text != "" {
-						runs = append(runs, textRun{x: curX, y: curY, sz: fontSize, text: text})
-					}
+					addRun(r.decodeToken(tokens[i-1], activeCmap))
 				}
 			}
 		}
@@ -733,10 +777,10 @@ func assembleRuns(runs []textRun) string {
 		return ""
 	}
 
-	// Sort: primary by y (ascending = top of page first), secondary by x.
+	// Sort: primary by y descending (high device y = top of page), secondary by x ascending.
 	sort.Slice(runs, func(i, j int) bool {
 		if math.Abs(runs[i].y-runs[j].y) > 2 {
-			return runs[i].y < runs[j].y
+			return runs[i].y > runs[j].y
 		}
 		return runs[i].x < runs[j].x
 	})
