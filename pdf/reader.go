@@ -196,8 +196,10 @@ func (r *Reader) loadFontCmaps() {
 
 // extractFontNames scans the whole file for /Font << ... >> dicts and
 // populates r.fontCmaps with font resource name -> CMap entries.
+// Handles both inline dicts (/Font << /F1 N G R >>) and indirect refs (/Font N G R).
 func (r *Reader) extractFontNames(fontObjToCmap map[int]map[uint32]string) {
 	refRE := regexp.MustCompile(`/(\w+)\s+(\d+)\s+\d+\s+R`)
+	indirRE := regexp.MustCompile(`^(\d+)\s+\d+\s+R`)
 	fontKey := []byte("/Font")
 	pos := 0
 
@@ -215,16 +217,29 @@ func (r *Reader) extractFontNames(fontObjToCmap map[int]map[uint32]string) {
 			i++
 		}
 
+		var dictContent string
 		if i+1 < len(after) && after[i] == '<' && after[i+1] == '<' {
-			dictContent := extractDictContent(after[i+2:])
-			for _, m := range refRE.FindAllStringSubmatch(dictContent, -1) {
-				fontObjNum, err := strconv.Atoi(m[2])
-				if err != nil {
-					continue
+			// Inline dict: /Font << /F1 N G R ... >>
+			dictContent = extractDictContent(after[i+2:])
+		} else if m := indirRE.FindSubmatch(after[i:]); m != nil {
+			// Indirect reference: /Font N G R — follow it to get the dict
+			if refNum, err := strconv.Atoi(string(m[1])); err == nil {
+				if body := r.readObjectData(refNum); body != nil {
+					bs := string(body)
+					if ddIdx := strings.Index(bs, "<<"); ddIdx != -1 {
+						dictContent = extractDictContent([]byte(bs[ddIdx+2:]))
+					}
 				}
-				if cmap, ok := fontObjToCmap[fontObjNum]; ok {
-					r.fontCmaps[m[1]] = cmap
-				}
+			}
+		}
+
+		for _, m := range refRE.FindAllStringSubmatch(dictContent, -1) {
+			fontObjNum, err := strconv.Atoi(m[2])
+			if err != nil {
+				continue
+			}
+			if cmap, ok := fontObjToCmap[fontObjNum]; ok {
+				r.fontCmaps[m[1]] = cmap
 			}
 		}
 
@@ -778,6 +793,13 @@ func (r *Reader) decodeToken(tok string, cmap map[uint32]string) string {
 	case strings.HasPrefix(tok, "<") && strings.HasSuffix(tok, ">"):
 		return r.decodeHexString(tok[1:len(tok)-1], cmap)
 	case strings.HasPrefix(tok, "(") && strings.HasSuffix(tok, ")"):
+		if cmap != nil {
+			// Decode raw bytes (preserving nulls) then apply the ToUnicode CMap.
+			// This is required for CIDFonts whose content streams encode glyphs
+			// as 2-byte pairs such as (\x00\x0e) where the first byte is 0x00.
+			raw := decodeLiteralStringToBytes(tok[1 : len(tok)-1])
+			return applyToUnicode(raw, cmap)
+		}
 		s := decodeLiteralString(tok[1 : len(tok)-1])
 		if isPrintableText(s) {
 			return s
@@ -864,11 +886,19 @@ func (r *Reader) processTJArray(content string, cmap map[uint32]string) string {
 		ch := content[i]
 		switch {
 		case ch == '(':
-			end, decoded := scanLiteralString(content, i)
-			if isPrintableText(decoded) {
-				sb.WriteString(decoded)
+			if cmap != nil {
+				end, raw := scanLiteralStringToBytes(content, i)
+				if decoded := applyToUnicode(raw, cmap); decoded != "" {
+					sb.WriteString(decoded)
+				}
+				i = end
+			} else {
+				end, decoded := scanLiteralString(content, i)
+				if isPrintableText(decoded) {
+					sb.WriteString(decoded)
+				}
+				i = end
 			}
-			i = end
 		case ch == '<':
 			closeIdx := strings.Index(content[i+1:], ">")
 			if closeIdx == -1 {
@@ -930,6 +960,86 @@ func scanLiteralString(s string, pos int) (int, string) {
 		}
 	}
 	return i, decodeLiteralString(raw.String())
+}
+
+// scanLiteralStringToBytes scans a PDF literal string at pos and returns
+// (position after closing ')', raw decoded bytes — all bytes preserved including nulls).
+func scanLiteralStringToBytes(s string, pos int) (int, []byte) {
+	if pos >= len(s) || s[pos] != '(' {
+		return pos + 1, nil
+	}
+	i := pos + 1
+	depth := 1
+	var raw strings.Builder
+	for i < len(s) && depth > 0 {
+		ch := s[i]
+		if ch == '\\' && i+1 < len(s) {
+			raw.WriteByte(ch)
+			raw.WriteByte(s[i+1])
+			i += 2
+		} else if ch == '(' {
+			depth++
+			raw.WriteByte(ch)
+			i++
+		} else if ch == ')' {
+			depth--
+			if depth > 0 {
+				raw.WriteByte(ch)
+			}
+			i++
+		} else {
+			raw.WriteByte(ch)
+			i++
+		}
+	}
+	return i, decodeLiteralStringToBytes(raw.String())
+}
+
+// decodeLiteralStringToBytes decodes a PDF literal string (escape sequences resolved)
+// into raw bytes, preserving ALL bytes including nulls.
+// This is needed for CIDFont strings that encode character codes as multi-byte pairs
+// (e.g. \x00\x0E for CID 14) which filterPrintable would otherwise discard.
+func decodeLiteralStringToBytes(s string) []byte {
+	var result []byte
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch != '\\' {
+			result = append(result, ch)
+			continue
+		}
+		i++
+		if i >= len(s) {
+			break
+		}
+		switch s[i] {
+		case 'n':
+			result = append(result, '\n')
+		case 'r':
+			result = append(result, '\r')
+		case 't':
+			result = append(result, '\t')
+		case 'b':
+			result = append(result, '\b')
+		case 'f':
+			result = append(result, '\f')
+		case '(', ')', '\\':
+			result = append(result, s[i])
+		case '0', '1', '2', '3', '4', '5', '6', '7':
+			octal := string(s[i])
+			j := i + 1
+			for j < len(s) && j < i+3 && s[j] >= '0' && s[j] <= '7' {
+				octal += string(s[j])
+				j++
+			}
+			if val, err := strconv.ParseInt(octal, 8, 32); err == nil && val < 256 {
+				result = append(result, byte(val))
+				i = j - 1
+			}
+		default:
+			result = append(result, s[i])
+		}
+	}
+	return result
 }
 
 // isPrintableText checks if a string is mostly readable text.
