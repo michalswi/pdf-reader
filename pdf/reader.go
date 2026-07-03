@@ -18,11 +18,12 @@ import (
 // Reader represents a PDF file reader.
 // Provides methods to extract text and get page information.
 type Reader struct {
-	file      *os.File
-	size      int64
-	data      []byte
-	xref      map[int]int64                // objNum -> byte offset of the "N G obj" line
-	fontCmaps map[string]map[uint32]string // font resource name -> glyph code -> Unicode string
+	file          *os.File
+	size          int64
+	data          []byte
+	xref          map[int]int64                // objNum -> byte offset of the "N G obj" line
+	fontCmaps     map[string]map[uint32]string // global fallback: resource name -> CMap
+	fontObjToCmap map[int]map[uint32]string    // font obj num -> CMap (for per-page lookups)
 }
 
 // Open opens a PDF file and returns a Reader.
@@ -40,10 +41,11 @@ func Open(filename string) (*os.File, *Reader, error) {
 	}
 
 	reader := &Reader{
-		file:      file,
-		size:      fileInfo.Size(),
-		xref:      make(map[int]int64),
-		fontCmaps: make(map[string]map[uint32]string),
+		file:          file,
+		size:          fileInfo.Size(),
+		xref:          make(map[int]int64),
+		fontCmaps:     make(map[string]map[uint32]string),
+		fontObjToCmap: make(map[int]map[uint32]string),
 	}
 
 	if err := reader.parse(); err != nil {
@@ -164,8 +166,8 @@ func (r *Reader) loadFontCmaps() {
 	typeRE := regexp.MustCompile(`/Type\s*/Font\b`)
 	tuRE := regexp.MustCompile(`/ToUnicode\s+(\d+)\s+\d+\s+R`)
 
-	// Step 1: font object number -> its ToUnicode CMap
-	fontObjToCmap := make(map[int]map[uint32]string)
+	// Step 1: font object number -> its ToUnicode CMap (saved for per-page resolution)
+	r.fontObjToCmap = make(map[int]map[uint32]string)
 	for objNum := range r.xref {
 		body := r.readObjectData(objNum)
 		if body == nil || !typeRE.Match(body) {
@@ -185,13 +187,12 @@ func (r *Reader) loadFontCmaps() {
 		}
 		cmap := parseCMap(streamData)
 		if len(cmap) > 0 {
-			fontObjToCmap[objNum] = cmap
+			r.fontObjToCmap[objNum] = cmap
 		}
 	}
 
-	// Step 2: scan the entire file for /Font << ... >> sections and map
-	// resource names to their CMaps.
-	r.extractFontNames(fontObjToCmap)
+	// Step 2: build global fallback fontCmaps (used when per-page lookup is unavailable)
+	r.extractFontNames(r.fontObjToCmap)
 }
 
 // extractFontNames scans the whole file for /Font << ... >> dicts and
@@ -421,8 +422,180 @@ func (r *Reader) Page(num int) Page {
 // GetPlainText extracts all text from the PDF and returns it as an io.Reader.
 func (r *Reader) GetPlainText() (io.Reader, error) {
 	var result bytes.Buffer
-	result.WriteString(r.extractTextFromData(r.data))
+	result.WriteString(r.extractAllText())
 	return &result, nil
+}
+
+// extractAllText extracts text from all pages and Form XObjects, using per-page
+// font resource mappings so that font names reused across pages resolve correctly.
+func (r *Reader) extractAllText() string {
+	seen := make(map[int]bool)
+	var sb strings.Builder
+
+	// Step 1: process each page with its own font resource mapping.
+	pageRE := regexp.MustCompile(`/Type\s*/Page\b`)
+	var pageObjs []int
+	for objNum := range r.xref {
+		body := r.readObjectData(objNum)
+		if body != nil && pageRE.Match(body) {
+			pageObjs = append(pageObjs, objNum)
+		}
+	}
+	sort.Ints(pageObjs)
+
+	for _, objNum := range pageObjs {
+		body := r.readObjectData(objNum)
+		if body == nil {
+			continue
+		}
+		localCmaps := r.buildLocalFontCmaps(body)
+		for _, contentObjNum := range r.findContents(body) {
+			if seen[contentObjNum] {
+				continue
+			}
+			seen[contentObjNum] = true
+			streamData := r.readStreamData(contentObjNum)
+			if streamData == nil {
+				continue
+			}
+			text := r.extractTextFromStream(streamData, localCmaps)
+			if text != "" {
+				sb.WriteString(text)
+				sb.WriteString("\n")
+			}
+		}
+	}
+
+	// Step 2: process Form XObjects (PDFs that embed text in XObjects rather than
+	// directly in page content streams, e.g. InDesign-generated PDFs).
+	formRE := regexp.MustCompile(`/Subtype\s*/Form\b`)
+	var xobjObjs []int
+	for objNum := range r.xref {
+		if seen[objNum] {
+			continue
+		}
+		body := r.readObjectData(objNum)
+		if body != nil && formRE.Match(body) {
+			xobjObjs = append(xobjObjs, objNum)
+		}
+	}
+	sort.Ints(xobjObjs)
+
+	for _, objNum := range xobjObjs {
+		seen[objNum] = true
+		body := r.readObjectData(objNum)
+		if body == nil {
+			continue
+		}
+		localCmaps := r.buildLocalFontCmaps(body)
+		if len(localCmaps) == 0 {
+			localCmaps = r.fontCmaps
+		}
+		streamData := r.readStreamData(objNum)
+		if streamData == nil {
+			continue
+		}
+		text := r.extractTextFromStream(streamData, localCmaps)
+		if text != "" {
+			sb.WriteString(text)
+			sb.WriteString("\n")
+		}
+	}
+
+	// Step 3: fall back to raw stream scanning if nothing was extracted above.
+	if sb.Len() == 0 {
+		return r.extractTextFromData(r.data)
+	}
+	return sb.String()
+}
+
+// buildLocalFontCmaps builds a font resource name → CMap map from a single
+// object body (page dict or Form XObject). Unlike the global r.fontCmaps, this
+// respects the exact font bindings for one page/XObject, which is necessary when
+// the same name (e.g. "f0") refers to different font objects on different pages.
+func (r *Reader) buildLocalFontCmaps(body []byte) map[string]map[uint32]string {
+	refRE := regexp.MustCompile(`/(\w+)\s+(\d+)\s+\d+\s+R`)
+	indirRE := regexp.MustCompile(`^(\d+)\s+\d+\s+R`)
+	result := make(map[string]map[uint32]string)
+
+	fontKey := []byte("/Font")
+	pos := 0
+	for {
+		idx := bytes.Index(body[pos:], fontKey)
+		if idx == -1 {
+			break
+		}
+		absIdx := pos + idx
+		after := body[absIdx+5:]
+
+		i := 0
+		for i < len(after) && isPDFWhitespace(after[i]) {
+			i++
+		}
+
+		var dictContent string
+		if i+1 < len(after) && after[i] == '<' && after[i+1] == '<' {
+			dictContent = extractDictContent(after[i+2:])
+		} else if m := indirRE.FindSubmatch(after[i:]); m != nil {
+			if refNum, err := strconv.Atoi(string(m[1])); err == nil {
+				if b := r.readObjectData(refNum); b != nil {
+					bs := string(b)
+					if ddIdx := strings.Index(bs, "<<"); ddIdx != -1 {
+						dictContent = extractDictContent([]byte(bs[ddIdx+2:]))
+					}
+				}
+			}
+		}
+
+		for _, m := range refRE.FindAllStringSubmatch(dictContent, -1) {
+			fontObjNum, err := strconv.Atoi(m[2])
+			if err != nil {
+				continue
+			}
+			if cmap, ok := r.fontObjToCmap[fontObjNum]; ok {
+				result[m[1]] = cmap
+			}
+		}
+
+		pos = absIdx + 5
+	}
+	return result
+}
+
+// findContents returns the object numbers of content streams for a page or XObject.
+// Handles both a single reference (/Contents N G R) and an array (/Contents [N G R ...]).
+func (r *Reader) findContents(body []byte) []int {
+	bs := string(body)
+	idx := strings.Index(bs, "/Contents")
+	if idx == -1 {
+		return nil
+	}
+	after := strings.TrimSpace(bs[idx+9:])
+
+	if strings.HasPrefix(after, "[") {
+		// Array form: /Contents [N 0 R M 0 R ...]
+		end := strings.Index(after, "]")
+		if end == -1 {
+			return nil
+		}
+		re := regexp.MustCompile(`(\d+)\s+\d+\s+R`)
+		var result []int
+		for _, m := range re.FindAllStringSubmatch(after[:end+1], -1) {
+			if n, err := strconv.Atoi(m[1]); err == nil {
+				result = append(result, n)
+			}
+		}
+		return result
+	}
+
+	// Single form: /Contents N 0 R
+	re := regexp.MustCompile(`^(\d+)\s+\d+\s+R`)
+	if m := re.FindStringSubmatch(after); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil {
+			return []int{n}
+		}
+	}
+	return nil
 }
 
 // ── Content stream processing ─────────────────────────────────────────────────
@@ -467,7 +640,7 @@ func (r *Reader) extractTextFromData(data []byte) string {
 			decompressed = streamData
 		}
 
-		text := r.extractTextFromStream(decompressed)
+		text := r.extractTextFromStream(decompressed, r.fontCmaps)
 		if text != "" {
 			result.WriteString(text)
 			result.WriteString("\n")
@@ -510,7 +683,8 @@ type textRun struct {
 // tracking the CTM (via q/Q/cm) and text state (font, position) so that each
 // glyph is decoded with the correct ToUnicode CMap and positioned in device
 // space for correct reading-order assembly.
-func (r *Reader) extractTextFromStream(data []byte) string {
+// fontCmaps maps font resource names to their ToUnicode CMaps for this stream.
+func (r *Reader) extractTextFromStream(data []byte, fontCmaps map[string]map[uint32]string) string {
 	tokens := tokenizePDF(string(data))
 	n := len(tokens)
 
@@ -571,7 +745,7 @@ func (r *Reader) extractTextFromStream(data []byte) string {
 				if sz, err := strconv.ParseFloat(tokens[i-1], 64); err == nil && sz > 0 {
 					fontSize = sz
 				}
-				activeCmap = r.fontCmaps[strings.TrimPrefix(tokens[i-2], "/")]
+				activeCmap = fontCmaps[strings.TrimPrefix(tokens[i-2], "/")]
 			}
 		case "Tm":
 			// a b c d e f Tm — set text matrix (all 6 components).
