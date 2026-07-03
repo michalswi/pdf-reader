@@ -293,8 +293,11 @@ func parseCMap(data []byte) map[uint32]string {
 }
 
 // parseBfChar parses beginbfchar entries of the form: <srcCode> <dstCode>
+// Uses [ \t]* (horizontal whitespace only) so entries with no space between
+// hex pairs (e.g. <0024><0041>) are matched correctly without crossing line
+// boundaries and accidentally pairing entries from adjacent lines.
 func parseBfChar(content string, result map[uint32]string) {
-	re := regexp.MustCompile(`<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>`)
+	re := regexp.MustCompile(`<([0-9A-Fa-f]+)>[ \t]*<([0-9A-Fa-f]+)>`)
 	for _, m := range re.FindAllStringSubmatch(content, -1) {
 		srcBytes, err := hex.DecodeString(m[1])
 		if err != nil || len(srcBytes) == 0 {
@@ -312,7 +315,7 @@ func parseBfChar(content string, result map[uint32]string) {
 // Supports both single-destination (<lo> <hi> <dst>) and array forms (<lo> <hi> [...]).
 func parseBfRange(content string, result map[uint32]string) {
 	// Array form first: <lo> <hi> [<d0> <d1> ...]
-	arrayRE := regexp.MustCompile(`<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>\s+\[([^\]]*)\]`)
+	arrayRE := regexp.MustCompile(`<([0-9A-Fa-f]+)>[ \t]*<([0-9A-Fa-f]+)>[ \t]*\[([^\]]*)\]`)
 	for _, m := range arrayRE.FindAllStringSubmatch(content, -1) {
 		loBytes, _ := hex.DecodeString(m[1])
 		hiBytes, _ := hex.DecodeString(m[2])
@@ -337,7 +340,7 @@ func parseBfRange(content string, result map[uint32]string) {
 	}
 
 	// Single destination: <lo> <hi> <dst>
-	singleRE := regexp.MustCompile(`<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>`)
+	singleRE := regexp.MustCompile(`<([0-9A-Fa-f]+)>[ \t]*<([0-9A-Fa-f]+)>[ \t]*<([0-9A-Fa-f]+)>`)
 	for _, m := range singleRE.FindAllStringSubmatch(content, -1) {
 		loBytes, _ := hex.DecodeString(m[1])
 		hiBytes, _ := hex.DecodeString(m[2])
@@ -449,6 +452,9 @@ func (r *Reader) extractAllText() string {
 			continue
 		}
 		localCmaps := r.buildLocalFontCmaps(body)
+		if len(localCmaps) == 0 {
+			localCmaps = r.fontCmaps
+		}
 		for _, contentObjNum := range r.findContents(body) {
 			if seen[contentObjNum] {
 				continue
@@ -513,51 +519,71 @@ func (r *Reader) extractAllText() string {
 // object body (page dict or Form XObject). Unlike the global r.fontCmaps, this
 // respects the exact font bindings for one page/XObject, which is necessary when
 // the same name (e.g. "f0") refers to different font objects on different pages.
+// Also follows /Resources N G R indirect references (common when all pages share
+// a single resource dictionary object).
 func (r *Reader) buildLocalFontCmaps(body []byte) map[string]map[uint32]string {
 	refRE := regexp.MustCompile(`/(\w+)\s+(\d+)\s+\d+\s+R`)
 	indirRE := regexp.MustCompile(`^(\d+)\s+\d+\s+R`)
 	result := make(map[string]map[uint32]string)
 
-	fontKey := []byte("/Font")
-	pos := 0
-	for {
-		idx := bytes.Index(body[pos:], fontKey)
-		if idx == -1 {
-			break
+	// Build the list of bodies to search: the given body plus any object
+	// referenced by /Resources N G R (pages often share one resource dict).
+	bodies := [][]byte{body}
+	resourcesRE := regexp.MustCompile(`/Resources\s+(\d+)\s+\d+\s+R`)
+	if m := resourcesRE.FindSubmatch(body); m != nil {
+		if refNum, err := strconv.Atoi(string(m[1])); err == nil {
+			if resBody := r.readObjectData(refNum); resBody != nil {
+				bodies = append(bodies, resBody)
+			}
 		}
-		absIdx := pos + idx
-		after := body[absIdx+5:]
+	}
 
-		i := 0
-		for i < len(after) && isPDFWhitespace(after[i]) {
-			i++
-		}
+	scanBody := func(b []byte) {
+		fontKey := []byte("/Font")
+		pos := 0
+		for {
+			idx := bytes.Index(b[pos:], fontKey)
+			if idx == -1 {
+				break
+			}
+			absIdx := pos + idx
+			after := b[absIdx+5:]
 
-		var dictContent string
-		if i+1 < len(after) && after[i] == '<' && after[i+1] == '<' {
-			dictContent = extractDictContent(after[i+2:])
-		} else if m := indirRE.FindSubmatch(after[i:]); m != nil {
-			if refNum, err := strconv.Atoi(string(m[1])); err == nil {
-				if b := r.readObjectData(refNum); b != nil {
-					bs := string(b)
-					if ddIdx := strings.Index(bs, "<<"); ddIdx != -1 {
-						dictContent = extractDictContent([]byte(bs[ddIdx+2:]))
+			i := 0
+			for i < len(after) && isPDFWhitespace(after[i]) {
+				i++
+			}
+
+			var dictContent string
+			if i+1 < len(after) && after[i] == '<' && after[i+1] == '<' {
+				dictContent = extractDictContent(after[i+2:])
+			} else if m := indirRE.FindSubmatch(after[i:]); m != nil {
+				if refNum, err := strconv.Atoi(string(m[1])); err == nil {
+					if b2 := r.readObjectData(refNum); b2 != nil {
+						bs := string(b2)
+						if ddIdx := strings.Index(bs, "<<"); ddIdx != -1 {
+							dictContent = extractDictContent([]byte(bs[ddIdx+2:]))
+						}
 					}
 				}
 			}
-		}
 
-		for _, m := range refRE.FindAllStringSubmatch(dictContent, -1) {
-			fontObjNum, err := strconv.Atoi(m[2])
-			if err != nil {
-				continue
+			for _, m := range refRE.FindAllStringSubmatch(dictContent, -1) {
+				fontObjNum, err := strconv.Atoi(m[2])
+				if err != nil {
+					continue
+				}
+				if cmap, ok := r.fontObjToCmap[fontObjNum]; ok {
+					result[m[1]] = cmap
+				}
 			}
-			if cmap, ok := r.fontObjToCmap[fontObjNum]; ok {
-				result[m[1]] = cmap
-			}
-		}
 
-		pos = absIdx + 5
+			pos = absIdx + 5
+		}
+	}
+
+	for _, b := range bodies {
+		scanBody(b)
 	}
 	return result
 }
