@@ -18,12 +18,13 @@ import (
 // Reader represents a PDF file reader.
 // Provides methods to extract text and get page information.
 type Reader struct {
-	file          *os.File
-	size          int64
-	data          []byte
-	xref          map[int]int64                // objNum -> byte offset of the "N G obj" line
-	fontCmaps     map[string]map[uint32]string // global fallback: resource name -> CMap
-	fontObjToCmap map[int]map[uint32]string    // font obj num -> CMap (for per-page lookups)
+	file           *os.File
+	size           int64
+	data           []byte
+	xref           map[int]int64                // objNum -> byte offset of the "N G obj" line
+	objStreamCache map[int][]byte               // objNum -> body bytes for objects inside ObjStm
+	fontCmaps      map[string]map[uint32]string // global fallback: resource name -> CMap
+	fontObjToCmap  map[int]map[uint32]string    // font obj num -> CMap (for per-page lookups)
 }
 
 // Open opens a PDF file and returns a Reader.
@@ -41,11 +42,12 @@ func Open(filename string) (*os.File, *Reader, error) {
 	}
 
 	reader := &Reader{
-		file:          file,
-		size:          fileInfo.Size(),
-		xref:          make(map[int]int64),
-		fontCmaps:     make(map[string]map[uint32]string),
-		fontObjToCmap: make(map[int]map[uint32]string),
+		file:           file,
+		size:           fileInfo.Size(),
+		xref:           make(map[int]int64),
+		objStreamCache: make(map[int][]byte),
+		fontCmaps:      make(map[string]map[uint32]string),
+		fontObjToCmap:  make(map[int]map[uint32]string),
 	}
 
 	if err := reader.parse(); err != nil {
@@ -68,17 +70,32 @@ func (r *Reader) parse() error {
 	}
 
 	r.scanObjects()
+	r.loadObjectStreams()
 	r.loadFontCmaps()
 	return nil
 }
 
 // ── Object index ─────────────────────────────────────────────────────────────
 
+// allObjectNums returns the set of all known object numbers, combining both
+// the regular xref table and any objects expanded from compressed ObjStm streams.
+func (r *Reader) allObjectNums() map[int]struct{} {
+	nums := make(map[int]struct{}, len(r.xref)+len(r.objStreamCache))
+	for n := range r.xref {
+		nums[n] = struct{}{}
+	}
+	for n := range r.objStreamCache {
+		nums[n] = struct{}{}
+	}
+	return nums
+}
+
 // scanObjects builds the xref index by scanning for "N G obj" patterns.
 // This works for both traditional xref tables and cross-reference streams
 // (PDF 1.5+) without requiring a full xref parser.
+// Handles \r\n, \n, and bare \r line endings (Go's (?m)^ only matches after \n).
 func (r *Reader) scanObjects() {
-	re := regexp.MustCompile(`(?m)^(\d+)\s+\d+\s+obj\b`)
+	re := regexp.MustCompile(`(?:^|[\r\n])(\d+)\s+\d+\s+obj\b`)
 	for _, m := range re.FindAllSubmatchIndex(r.data, -1) {
 		objNum, _ := strconv.Atoi(string(r.data[m[2]:m[3]]))
 		if _, exists := r.xref[objNum]; !exists {
@@ -89,6 +106,11 @@ func (r *Reader) scanObjects() {
 
 // readObjectData returns the raw bytes of object N's body (between "obj" and "endobj").
 func (r *Reader) readObjectData(objNum int) []byte {
+	// Objects embedded in a compressed ObjStm are stored directly in the cache.
+	if body, ok := r.objStreamCache[objNum]; ok {
+		return body
+	}
+
 	offset, ok := r.xref[objNum]
 	if !ok {
 		return nil
@@ -109,6 +131,76 @@ func (r *Reader) readObjectData(objNum int) []byte {
 		return nil
 	}
 	return r.data[bodyStart : bodyStart+endIdx]
+}
+
+// loadObjectStreams expands all compressed object streams (ObjStm) found in r.xref,
+// populating r.objStreamCache with the embedded objects so that readObjectData can
+// find them alongside regular objects.  ObjStm is a PDF 1.5+ feature that packs
+// many dictionary-only objects (page dicts, font dicts, etc.) into a single
+// compressed stream to reduce file size.
+func (r *Reader) loadObjectStreams() {
+	typeRE := regexp.MustCompile(`/Type\s*/ObjStm\b`)
+	nRE := regexp.MustCompile(`/N\s+(\d+)\b`)
+	firstRE := regexp.MustCompile(`/First\s+(\d+)\b`)
+	pairRE := regexp.MustCompile(`(\d+)\s+(\d+)`)
+
+	for objNum := range r.xref {
+		body := r.readObjectData(objNum)
+		if body == nil || !typeRE.Match(body) {
+			continue
+		}
+
+		mN := nRE.FindSubmatch(body)
+		mFirst := firstRE.FindSubmatch(body)
+		if mN == nil || mFirst == nil {
+			continue
+		}
+
+		n, err := strconv.Atoi(string(mN[1]))
+		if err != nil || n <= 0 {
+			continue
+		}
+		first, err := strconv.Atoi(string(mFirst[1]))
+		if err != nil || first <= 0 {
+			continue
+		}
+
+		streamData := r.readStreamData(objNum)
+		if streamData == nil || len(streamData) <= first {
+			continue
+		}
+
+		// Header section: N pairs of (embObjNum, byteOffsetRelativeToFirst).
+		headerStr := string(streamData[:first])
+		bodies := streamData[first:]
+		pairs := pairRE.FindAllStringSubmatch(headerStr, -1)
+
+		for i := 0; i < n && i < len(pairs); i++ {
+			embObjNum, err1 := strconv.Atoi(pairs[i][1])
+			relOff, err2 := strconv.Atoi(pairs[i][2])
+			if err1 != nil || err2 != nil || relOff >= len(bodies) {
+				continue
+			}
+
+			endOff := len(bodies)
+			if i+1 < n && i+1 < len(pairs) {
+				if nextOff, err := strconv.Atoi(pairs[i+1][2]); err == nil && nextOff <= len(bodies) {
+					endOff = nextOff
+				}
+			}
+
+			objBody := bytes.TrimSpace(bodies[relOff:endOff])
+			if len(objBody) > 0 {
+				// Prefer direct objects over ObjStm entries (shouldn't conflict in a
+				// valid PDF, but be safe when there are incremental updates).
+				if _, exists := r.xref[embObjNum]; !exists {
+					if _, exists2 := r.objStreamCache[embObjNum]; !exists2 {
+						r.objStreamCache[embObjNum] = objBody
+					}
+				}
+			}
+		}
+	}
 }
 
 // readStreamData reads and decompresses the stream of indirect object N.
@@ -168,7 +260,7 @@ func (r *Reader) loadFontCmaps() {
 
 	// Step 1: font object number -> its ToUnicode CMap (saved for per-page resolution)
 	r.fontObjToCmap = make(map[int]map[uint32]string)
-	for objNum := range r.xref {
+	for objNum := range r.allObjectNums() {
 		body := r.readObjectData(objNum)
 		if body == nil || !typeRE.Match(body) {
 			continue
@@ -438,7 +530,7 @@ func (r *Reader) extractAllText() string {
 	// Step 1: process each page with its own font resource mapping.
 	pageRE := regexp.MustCompile(`/Type\s*/Page\b`)
 	var pageObjs []int
-	for objNum := range r.xref {
+	for objNum := range r.allObjectNums() {
 		body := r.readObjectData(objNum)
 		if body != nil && pageRE.Match(body) {
 			pageObjs = append(pageObjs, objNum)
@@ -476,7 +568,7 @@ func (r *Reader) extractAllText() string {
 	// directly in page content streams, e.g. InDesign-generated PDFs).
 	formRE := regexp.MustCompile(`/Subtype\s*/Form\b`)
 	var xobjObjs []int
-	for objNum := range r.xref {
+	for objNum := range r.allObjectNums() {
 		if seen[objNum] {
 			continue
 		}
@@ -1328,10 +1420,16 @@ func decodeUTF16BE(data []byte) string {
 	return result.String()
 }
 
-// filterPrintable removes non-printable characters except common whitespace
+// filterPrintable removes non-printable characters except common whitespace.
+// U+FFFD (replacement character) is explicitly excluded because Go's range loop
+// substitutes it for every invalid UTF-8 byte sequence; allowing it would let
+// raw binary data leak into the output.
 func filterPrintable(s string) string {
 	var result strings.Builder
 	for _, r := range s {
+		if r == unicode.ReplacementChar {
+			continue
+		}
 		if unicode.IsPrint(r) || r == '\n' || r == '\r' || r == '\t' || r == ' ' {
 			result.WriteRune(r)
 		}
