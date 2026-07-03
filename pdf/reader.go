@@ -18,11 +18,13 @@ import (
 // Reader represents a PDF file reader.
 // Provides methods to extract text and get page information.
 type Reader struct {
-	file      *os.File
-	size      int64
-	data      []byte
-	xref      map[int]int64                // objNum -> byte offset of the "N G obj" line
-	fontCmaps map[string]map[uint32]string // font resource name -> glyph code -> Unicode string
+	file           *os.File
+	size           int64
+	data           []byte
+	xref           map[int]int64                // objNum -> byte offset of the "N G obj" line
+	objStreamCache map[int][]byte               // objNum -> body bytes for objects inside ObjStm
+	fontCmaps      map[string]map[uint32]string // global fallback: resource name -> CMap
+	fontObjToCmap  map[int]map[uint32]string    // font obj num -> CMap (for per-page lookups)
 }
 
 // Open opens a PDF file and returns a Reader.
@@ -40,10 +42,12 @@ func Open(filename string) (*os.File, *Reader, error) {
 	}
 
 	reader := &Reader{
-		file:      file,
-		size:      fileInfo.Size(),
-		xref:      make(map[int]int64),
-		fontCmaps: make(map[string]map[uint32]string),
+		file:           file,
+		size:           fileInfo.Size(),
+		xref:           make(map[int]int64),
+		objStreamCache: make(map[int][]byte),
+		fontCmaps:      make(map[string]map[uint32]string),
+		fontObjToCmap:  make(map[int]map[uint32]string),
 	}
 
 	if err := reader.parse(); err != nil {
@@ -66,17 +70,32 @@ func (r *Reader) parse() error {
 	}
 
 	r.scanObjects()
+	r.loadObjectStreams()
 	r.loadFontCmaps()
 	return nil
 }
 
 // ── Object index ─────────────────────────────────────────────────────────────
 
+// allObjectNums returns the set of all known object numbers, combining both
+// the regular xref table and any objects expanded from compressed ObjStm streams.
+func (r *Reader) allObjectNums() map[int]struct{} {
+	nums := make(map[int]struct{}, len(r.xref)+len(r.objStreamCache))
+	for n := range r.xref {
+		nums[n] = struct{}{}
+	}
+	for n := range r.objStreamCache {
+		nums[n] = struct{}{}
+	}
+	return nums
+}
+
 // scanObjects builds the xref index by scanning for "N G obj" patterns.
 // This works for both traditional xref tables and cross-reference streams
 // (PDF 1.5+) without requiring a full xref parser.
+// Handles \r\n, \n, and bare \r line endings (Go's (?m)^ only matches after \n).
 func (r *Reader) scanObjects() {
-	re := regexp.MustCompile(`(?m)^(\d+)\s+\d+\s+obj\b`)
+	re := regexp.MustCompile(`(?:^|[\r\n])(\d+)\s+\d+\s+obj\b`)
 	for _, m := range re.FindAllSubmatchIndex(r.data, -1) {
 		objNum, _ := strconv.Atoi(string(r.data[m[2]:m[3]]))
 		if _, exists := r.xref[objNum]; !exists {
@@ -87,6 +106,11 @@ func (r *Reader) scanObjects() {
 
 // readObjectData returns the raw bytes of object N's body (between "obj" and "endobj").
 func (r *Reader) readObjectData(objNum int) []byte {
+	// Objects embedded in a compressed ObjStm are stored directly in the cache.
+	if body, ok := r.objStreamCache[objNum]; ok {
+		return body
+	}
+
 	offset, ok := r.xref[objNum]
 	if !ok {
 		return nil
@@ -107,6 +131,76 @@ func (r *Reader) readObjectData(objNum int) []byte {
 		return nil
 	}
 	return r.data[bodyStart : bodyStart+endIdx]
+}
+
+// loadObjectStreams expands all compressed object streams (ObjStm) found in r.xref,
+// populating r.objStreamCache with the embedded objects so that readObjectData can
+// find them alongside regular objects.  ObjStm is a PDF 1.5+ feature that packs
+// many dictionary-only objects (page dicts, font dicts, etc.) into a single
+// compressed stream to reduce file size.
+func (r *Reader) loadObjectStreams() {
+	typeRE := regexp.MustCompile(`/Type\s*/ObjStm\b`)
+	nRE := regexp.MustCompile(`/N\s+(\d+)\b`)
+	firstRE := regexp.MustCompile(`/First\s+(\d+)\b`)
+	pairRE := regexp.MustCompile(`(\d+)\s+(\d+)`)
+
+	for objNum := range r.xref {
+		body := r.readObjectData(objNum)
+		if body == nil || !typeRE.Match(body) {
+			continue
+		}
+
+		mN := nRE.FindSubmatch(body)
+		mFirst := firstRE.FindSubmatch(body)
+		if mN == nil || mFirst == nil {
+			continue
+		}
+
+		n, err := strconv.Atoi(string(mN[1]))
+		if err != nil || n <= 0 {
+			continue
+		}
+		first, err := strconv.Atoi(string(mFirst[1]))
+		if err != nil || first <= 0 {
+			continue
+		}
+
+		streamData := r.readStreamData(objNum)
+		if streamData == nil || len(streamData) <= first {
+			continue
+		}
+
+		// Header section: N pairs of (embObjNum, byteOffsetRelativeToFirst).
+		headerStr := string(streamData[:first])
+		bodies := streamData[first:]
+		pairs := pairRE.FindAllStringSubmatch(headerStr, -1)
+
+		for i := 0; i < n && i < len(pairs); i++ {
+			embObjNum, err1 := strconv.Atoi(pairs[i][1])
+			relOff, err2 := strconv.Atoi(pairs[i][2])
+			if err1 != nil || err2 != nil || relOff >= len(bodies) {
+				continue
+			}
+
+			endOff := len(bodies)
+			if i+1 < n && i+1 < len(pairs) {
+				if nextOff, err := strconv.Atoi(pairs[i+1][2]); err == nil && nextOff <= len(bodies) {
+					endOff = nextOff
+				}
+			}
+
+			objBody := bytes.TrimSpace(bodies[relOff:endOff])
+			if len(objBody) > 0 {
+				// Prefer direct objects over ObjStm entries (shouldn't conflict in a
+				// valid PDF, but be safe when there are incremental updates).
+				if _, exists := r.xref[embObjNum]; !exists {
+					if _, exists2 := r.objStreamCache[embObjNum]; !exists2 {
+						r.objStreamCache[embObjNum] = objBody
+					}
+				}
+			}
+		}
+	}
 }
 
 // readStreamData reads and decompresses the stream of indirect object N.
@@ -164,9 +258,9 @@ func (r *Reader) loadFontCmaps() {
 	typeRE := regexp.MustCompile(`/Type\s*/Font\b`)
 	tuRE := regexp.MustCompile(`/ToUnicode\s+(\d+)\s+\d+\s+R`)
 
-	// Step 1: font object number -> its ToUnicode CMap
-	fontObjToCmap := make(map[int]map[uint32]string)
-	for objNum := range r.xref {
+	// Step 1: font object number -> its ToUnicode CMap (saved for per-page resolution)
+	r.fontObjToCmap = make(map[int]map[uint32]string)
+	for objNum := range r.allObjectNums() {
 		body := r.readObjectData(objNum)
 		if body == nil || !typeRE.Match(body) {
 			continue
@@ -185,19 +279,20 @@ func (r *Reader) loadFontCmaps() {
 		}
 		cmap := parseCMap(streamData)
 		if len(cmap) > 0 {
-			fontObjToCmap[objNum] = cmap
+			r.fontObjToCmap[objNum] = cmap
 		}
 	}
 
-	// Step 2: scan the entire file for /Font << ... >> sections and map
-	// resource names to their CMaps.
-	r.extractFontNames(fontObjToCmap)
+	// Step 2: build global fallback fontCmaps (used when per-page lookup is unavailable)
+	r.extractFontNames(r.fontObjToCmap)
 }
 
 // extractFontNames scans the whole file for /Font << ... >> dicts and
 // populates r.fontCmaps with font resource name -> CMap entries.
+// Handles both inline dicts (/Font << /F1 N G R >>) and indirect refs (/Font N G R).
 func (r *Reader) extractFontNames(fontObjToCmap map[int]map[uint32]string) {
 	refRE := regexp.MustCompile(`/(\w+)\s+(\d+)\s+\d+\s+R`)
+	indirRE := regexp.MustCompile(`^(\d+)\s+\d+\s+R`)
 	fontKey := []byte("/Font")
 	pos := 0
 
@@ -215,16 +310,29 @@ func (r *Reader) extractFontNames(fontObjToCmap map[int]map[uint32]string) {
 			i++
 		}
 
+		var dictContent string
 		if i+1 < len(after) && after[i] == '<' && after[i+1] == '<' {
-			dictContent := extractDictContent(after[i+2:])
-			for _, m := range refRE.FindAllStringSubmatch(dictContent, -1) {
-				fontObjNum, err := strconv.Atoi(m[2])
-				if err != nil {
-					continue
+			// Inline dict: /Font << /F1 N G R ... >>
+			dictContent = extractDictContent(after[i+2:])
+		} else if m := indirRE.FindSubmatch(after[i:]); m != nil {
+			// Indirect reference: /Font N G R — follow it to get the dict
+			if refNum, err := strconv.Atoi(string(m[1])); err == nil {
+				if body := r.readObjectData(refNum); body != nil {
+					bs := string(body)
+					if ddIdx := strings.Index(bs, "<<"); ddIdx != -1 {
+						dictContent = extractDictContent([]byte(bs[ddIdx+2:]))
+					}
 				}
-				if cmap, ok := fontObjToCmap[fontObjNum]; ok {
-					r.fontCmaps[m[1]] = cmap
-				}
+			}
+		}
+
+		for _, m := range refRE.FindAllStringSubmatch(dictContent, -1) {
+			fontObjNum, err := strconv.Atoi(m[2])
+			if err != nil {
+				continue
+			}
+			if cmap, ok := fontObjToCmap[fontObjNum]; ok {
+				r.fontCmaps[m[1]] = cmap
 			}
 		}
 
@@ -277,8 +385,11 @@ func parseCMap(data []byte) map[uint32]string {
 }
 
 // parseBfChar parses beginbfchar entries of the form: <srcCode> <dstCode>
+// Uses [ \t]* (horizontal whitespace only) so entries with no space between
+// hex pairs (e.g. <0024><0041>) are matched correctly without crossing line
+// boundaries and accidentally pairing entries from adjacent lines.
 func parseBfChar(content string, result map[uint32]string) {
-	re := regexp.MustCompile(`<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>`)
+	re := regexp.MustCompile(`<([0-9A-Fa-f]+)>[ \t]*<([0-9A-Fa-f]+)>`)
 	for _, m := range re.FindAllStringSubmatch(content, -1) {
 		srcBytes, err := hex.DecodeString(m[1])
 		if err != nil || len(srcBytes) == 0 {
@@ -296,7 +407,7 @@ func parseBfChar(content string, result map[uint32]string) {
 // Supports both single-destination (<lo> <hi> <dst>) and array forms (<lo> <hi> [...]).
 func parseBfRange(content string, result map[uint32]string) {
 	// Array form first: <lo> <hi> [<d0> <d1> ...]
-	arrayRE := regexp.MustCompile(`<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>\s+\[([^\]]*)\]`)
+	arrayRE := regexp.MustCompile(`<([0-9A-Fa-f]+)>[ \t]*<([0-9A-Fa-f]+)>[ \t]*\[([^\]]*)\]`)
 	for _, m := range arrayRE.FindAllStringSubmatch(content, -1) {
 		loBytes, _ := hex.DecodeString(m[1])
 		hiBytes, _ := hex.DecodeString(m[2])
@@ -321,7 +432,7 @@ func parseBfRange(content string, result map[uint32]string) {
 	}
 
 	// Single destination: <lo> <hi> <dst>
-	singleRE := regexp.MustCompile(`<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>`)
+	singleRE := regexp.MustCompile(`<([0-9A-Fa-f]+)>[ \t]*<([0-9A-Fa-f]+)>[ \t]*<([0-9A-Fa-f]+)>`)
 	for _, m := range singleRE.FindAllStringSubmatch(content, -1) {
 		loBytes, _ := hex.DecodeString(m[1])
 		hiBytes, _ := hex.DecodeString(m[2])
@@ -406,8 +517,203 @@ func (r *Reader) Page(num int) Page {
 // GetPlainText extracts all text from the PDF and returns it as an io.Reader.
 func (r *Reader) GetPlainText() (io.Reader, error) {
 	var result bytes.Buffer
-	result.WriteString(r.extractTextFromData(r.data))
+	result.WriteString(r.extractAllText())
 	return &result, nil
+}
+
+// extractAllText extracts text from all pages and Form XObjects, using per-page
+// font resource mappings so that font names reused across pages resolve correctly.
+func (r *Reader) extractAllText() string {
+	seen := make(map[int]bool)
+	var sb strings.Builder
+
+	// Step 1: process each page with its own font resource mapping.
+	pageRE := regexp.MustCompile(`/Type\s*/Page\b`)
+	var pageObjs []int
+	for objNum := range r.allObjectNums() {
+		body := r.readObjectData(objNum)
+		if body != nil && pageRE.Match(body) {
+			pageObjs = append(pageObjs, objNum)
+		}
+	}
+	sort.Ints(pageObjs)
+
+	for _, objNum := range pageObjs {
+		body := r.readObjectData(objNum)
+		if body == nil {
+			continue
+		}
+		localCmaps := r.buildLocalFontCmaps(body)
+		if len(localCmaps) == 0 {
+			localCmaps = r.fontCmaps
+		}
+		for _, contentObjNum := range r.findContents(body) {
+			if seen[contentObjNum] {
+				continue
+			}
+			seen[contentObjNum] = true
+			streamData := r.readStreamData(contentObjNum)
+			if streamData == nil {
+				continue
+			}
+			text := r.extractTextFromStream(streamData, localCmaps)
+			if text != "" {
+				sb.WriteString(text)
+				sb.WriteString("\n")
+			}
+		}
+	}
+
+	// Step 2: process Form XObjects (PDFs that embed text in XObjects rather than
+	// directly in page content streams, e.g. InDesign-generated PDFs).
+	formRE := regexp.MustCompile(`/Subtype\s*/Form\b`)
+	var xobjObjs []int
+	for objNum := range r.allObjectNums() {
+		if seen[objNum] {
+			continue
+		}
+		body := r.readObjectData(objNum)
+		if body != nil && formRE.Match(body) {
+			xobjObjs = append(xobjObjs, objNum)
+		}
+	}
+	sort.Ints(xobjObjs)
+
+	for _, objNum := range xobjObjs {
+		seen[objNum] = true
+		body := r.readObjectData(objNum)
+		if body == nil {
+			continue
+		}
+		localCmaps := r.buildLocalFontCmaps(body)
+		if len(localCmaps) == 0 {
+			localCmaps = r.fontCmaps
+		}
+		streamData := r.readStreamData(objNum)
+		if streamData == nil {
+			continue
+		}
+		text := r.extractTextFromStream(streamData, localCmaps)
+		if text != "" {
+			sb.WriteString(text)
+			sb.WriteString("\n")
+		}
+	}
+
+	// Step 3: fall back to raw stream scanning if nothing was extracted above.
+	if sb.Len() == 0 {
+		return r.extractTextFromData(r.data)
+	}
+	return sb.String()
+}
+
+// buildLocalFontCmaps builds a font resource name → CMap map from a single
+// object body (page dict or Form XObject). Unlike the global r.fontCmaps, this
+// respects the exact font bindings for one page/XObject, which is necessary when
+// the same name (e.g. "f0") refers to different font objects on different pages.
+// Also follows /Resources N G R indirect references (common when all pages share
+// a single resource dictionary object).
+func (r *Reader) buildLocalFontCmaps(body []byte) map[string]map[uint32]string {
+	refRE := regexp.MustCompile(`/(\w+)\s+(\d+)\s+\d+\s+R`)
+	indirRE := regexp.MustCompile(`^(\d+)\s+\d+\s+R`)
+	result := make(map[string]map[uint32]string)
+
+	// Build the list of bodies to search: the given body plus any object
+	// referenced by /Resources N G R (pages often share one resource dict).
+	bodies := [][]byte{body}
+	resourcesRE := regexp.MustCompile(`/Resources\s+(\d+)\s+\d+\s+R`)
+	if m := resourcesRE.FindSubmatch(body); m != nil {
+		if refNum, err := strconv.Atoi(string(m[1])); err == nil {
+			if resBody := r.readObjectData(refNum); resBody != nil {
+				bodies = append(bodies, resBody)
+			}
+		}
+	}
+
+	scanBody := func(b []byte) {
+		fontKey := []byte("/Font")
+		pos := 0
+		for {
+			idx := bytes.Index(b[pos:], fontKey)
+			if idx == -1 {
+				break
+			}
+			absIdx := pos + idx
+			after := b[absIdx+5:]
+
+			i := 0
+			for i < len(after) && isPDFWhitespace(after[i]) {
+				i++
+			}
+
+			var dictContent string
+			if i+1 < len(after) && after[i] == '<' && after[i+1] == '<' {
+				dictContent = extractDictContent(after[i+2:])
+			} else if m := indirRE.FindSubmatch(after[i:]); m != nil {
+				if refNum, err := strconv.Atoi(string(m[1])); err == nil {
+					if b2 := r.readObjectData(refNum); b2 != nil {
+						bs := string(b2)
+						if ddIdx := strings.Index(bs, "<<"); ddIdx != -1 {
+							dictContent = extractDictContent([]byte(bs[ddIdx+2:]))
+						}
+					}
+				}
+			}
+
+			for _, m := range refRE.FindAllStringSubmatch(dictContent, -1) {
+				fontObjNum, err := strconv.Atoi(m[2])
+				if err != nil {
+					continue
+				}
+				if cmap, ok := r.fontObjToCmap[fontObjNum]; ok {
+					result[m[1]] = cmap
+				}
+			}
+
+			pos = absIdx + 5
+		}
+	}
+
+	for _, b := range bodies {
+		scanBody(b)
+	}
+	return result
+}
+
+// findContents returns the object numbers of content streams for a page or XObject.
+// Handles both a single reference (/Contents N G R) and an array (/Contents [N G R ...]).
+func (r *Reader) findContents(body []byte) []int {
+	bs := string(body)
+	idx := strings.Index(bs, "/Contents")
+	if idx == -1 {
+		return nil
+	}
+	after := strings.TrimSpace(bs[idx+9:])
+
+	if strings.HasPrefix(after, "[") {
+		// Array form: /Contents [N 0 R M 0 R ...]
+		end := strings.Index(after, "]")
+		if end == -1 {
+			return nil
+		}
+		re := regexp.MustCompile(`(\d+)\s+\d+\s+R`)
+		var result []int
+		for _, m := range re.FindAllStringSubmatch(after[:end+1], -1) {
+			if n, err := strconv.Atoi(m[1]); err == nil {
+				result = append(result, n)
+			}
+		}
+		return result
+	}
+
+	// Single form: /Contents N 0 R
+	re := regexp.MustCompile(`^(\d+)\s+\d+\s+R`)
+	if m := re.FindStringSubmatch(after); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil {
+			return []int{n}
+		}
+	}
+	return nil
 }
 
 // ── Content stream processing ─────────────────────────────────────────────────
@@ -452,7 +758,7 @@ func (r *Reader) extractTextFromData(data []byte) string {
 			decompressed = streamData
 		}
 
-		text := r.extractTextFromStream(decompressed)
+		text := r.extractTextFromStream(decompressed, r.fontCmaps)
 		if text != "" {
 			result.WriteString(text)
 			result.WriteString("\n")
@@ -495,7 +801,8 @@ type textRun struct {
 // tracking the CTM (via q/Q/cm) and text state (font, position) so that each
 // glyph is decoded with the correct ToUnicode CMap and positioned in device
 // space for correct reading-order assembly.
-func (r *Reader) extractTextFromStream(data []byte) string {
+// fontCmaps maps font resource names to their ToUnicode CMaps for this stream.
+func (r *Reader) extractTextFromStream(data []byte, fontCmaps map[string]map[uint32]string) string {
 	tokens := tokenizePDF(string(data))
 	n := len(tokens)
 
@@ -556,7 +863,7 @@ func (r *Reader) extractTextFromStream(data []byte) string {
 				if sz, err := strconv.ParseFloat(tokens[i-1], 64); err == nil && sz > 0 {
 					fontSize = sz
 				}
-				activeCmap = r.fontCmaps[strings.TrimPrefix(tokens[i-2], "/")]
+				activeCmap = fontCmaps[strings.TrimPrefix(tokens[i-2], "/")]
 			}
 		case "Tm":
 			// a b c d e f Tm — set text matrix (all 6 components).
@@ -685,7 +992,9 @@ func tokenizePDF(content string) []string {
 				for i < n && content[i] != '>' {
 					i++
 				}
-				i++ // skip '>'
+				if i < n {
+					i++ // skip '>'
+				}
 				tokens = append(tokens, content[start:i])
 			}
 
@@ -743,7 +1052,9 @@ func tokenizePDF(content string) []string {
 						for i < n && content[i] != '>' {
 							i++
 						}
-						i++
+						if i < n {
+							i++ // skip '>'
+						}
 					}
 				default:
 					i++
@@ -774,6 +1085,13 @@ func (r *Reader) decodeToken(tok string, cmap map[uint32]string) string {
 	case strings.HasPrefix(tok, "<") && strings.HasSuffix(tok, ">"):
 		return r.decodeHexString(tok[1:len(tok)-1], cmap)
 	case strings.HasPrefix(tok, "(") && strings.HasSuffix(tok, ")"):
+		if cmap != nil {
+			// Decode raw bytes (preserving nulls) then apply the ToUnicode CMap.
+			// This is required for CIDFonts whose content streams encode glyphs
+			// as 2-byte pairs such as (\x00\x0e) where the first byte is 0x00.
+			raw := decodeLiteralStringToBytes(tok[1 : len(tok)-1])
+			return applyToUnicode(raw, cmap)
+		}
 		s := decodeLiteralString(tok[1 : len(tok)-1])
 		if isPrintableText(s) {
 			return s
@@ -860,11 +1178,19 @@ func (r *Reader) processTJArray(content string, cmap map[uint32]string) string {
 		ch := content[i]
 		switch {
 		case ch == '(':
-			end, decoded := scanLiteralString(content, i)
-			if isPrintableText(decoded) {
-				sb.WriteString(decoded)
+			if cmap != nil {
+				end, raw := scanLiteralStringToBytes(content, i)
+				if decoded := applyToUnicode(raw, cmap); decoded != "" {
+					sb.WriteString(decoded)
+				}
+				i = end
+			} else {
+				end, decoded := scanLiteralString(content, i)
+				if isPrintableText(decoded) {
+					sb.WriteString(decoded)
+				}
+				i = end
 			}
-			i = end
 		case ch == '<':
 			closeIdx := strings.Index(content[i+1:], ">")
 			if closeIdx == -1 {
@@ -926,6 +1252,86 @@ func scanLiteralString(s string, pos int) (int, string) {
 		}
 	}
 	return i, decodeLiteralString(raw.String())
+}
+
+// scanLiteralStringToBytes scans a PDF literal string at pos and returns
+// (position after closing ')', raw decoded bytes — all bytes preserved including nulls).
+func scanLiteralStringToBytes(s string, pos int) (int, []byte) {
+	if pos >= len(s) || s[pos] != '(' {
+		return pos + 1, nil
+	}
+	i := pos + 1
+	depth := 1
+	var raw strings.Builder
+	for i < len(s) && depth > 0 {
+		ch := s[i]
+		if ch == '\\' && i+1 < len(s) {
+			raw.WriteByte(ch)
+			raw.WriteByte(s[i+1])
+			i += 2
+		} else if ch == '(' {
+			depth++
+			raw.WriteByte(ch)
+			i++
+		} else if ch == ')' {
+			depth--
+			if depth > 0 {
+				raw.WriteByte(ch)
+			}
+			i++
+		} else {
+			raw.WriteByte(ch)
+			i++
+		}
+	}
+	return i, decodeLiteralStringToBytes(raw.String())
+}
+
+// decodeLiteralStringToBytes decodes a PDF literal string (escape sequences resolved)
+// into raw bytes, preserving ALL bytes including nulls.
+// This is needed for CIDFont strings that encode character codes as multi-byte pairs
+// (e.g. \x00\x0E for CID 14) which filterPrintable would otherwise discard.
+func decodeLiteralStringToBytes(s string) []byte {
+	var result []byte
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch != '\\' {
+			result = append(result, ch)
+			continue
+		}
+		i++
+		if i >= len(s) {
+			break
+		}
+		switch s[i] {
+		case 'n':
+			result = append(result, '\n')
+		case 'r':
+			result = append(result, '\r')
+		case 't':
+			result = append(result, '\t')
+		case 'b':
+			result = append(result, '\b')
+		case 'f':
+			result = append(result, '\f')
+		case '(', ')', '\\':
+			result = append(result, s[i])
+		case '0', '1', '2', '3', '4', '5', '6', '7':
+			octal := string(s[i])
+			j := i + 1
+			for j < len(s) && j < i+3 && s[j] >= '0' && s[j] <= '7' {
+				octal += string(s[j])
+				j++
+			}
+			if val, err := strconv.ParseInt(octal, 8, 32); err == nil && val < 256 {
+				result = append(result, byte(val))
+				i = j - 1
+			}
+		default:
+			result = append(result, s[i])
+		}
+	}
+	return result
 }
 
 // isPrintableText checks if a string is mostly readable text.
@@ -1014,10 +1420,16 @@ func decodeUTF16BE(data []byte) string {
 	return result.String()
 }
 
-// filterPrintable removes non-printable characters except common whitespace
+// filterPrintable removes non-printable characters except common whitespace.
+// U+FFFD (replacement character) is explicitly excluded because Go's range loop
+// substitutes it for every invalid UTF-8 byte sequence; allowing it would let
+// raw binary data leak into the output.
 func filterPrintable(s string) string {
 	var result strings.Builder
 	for _, r := range s {
+		if r == unicode.ReplacementChar {
+			continue
+		}
 		if unicode.IsPrint(r) || r == '\n' || r == '\r' || r == '\t' || r == ' ' {
 			result.WriteRune(r)
 		}
