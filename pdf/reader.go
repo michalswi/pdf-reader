@@ -644,7 +644,10 @@ func tokenizePDF(content string) []string {
 			for i < n && depth > 0 {
 				switch content[i] {
 				case '\\':
-					i += 2 // skip escaped character
+					i++ // skip backslash
+					if i < n {
+						i++ // skip escaped character
+					}
 				case '(':
 					depth++
 					i++
@@ -705,7 +708,10 @@ func tokenizePDF(content string) []string {
 					d := 1
 					for i < n && d > 0 {
 						if content[i] == '\\' {
-							i += 2
+							i++ // skip backslash
+							if i < n {
+								i++ // skip escaped character
+							}
 						} else if content[i] == '(' {
 							d++
 							i++

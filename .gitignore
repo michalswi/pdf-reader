@@ -4,3 +4,5 @@ pdf-reader_*
 *.pdf
 *.sha256
 *.txt
+
+.DS_Store
