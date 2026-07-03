@@ -685,7 +685,9 @@ func tokenizePDF(content string) []string {
 				for i < n && content[i] != '>' {
 					i++
 				}
-				i++ // skip '>'
+				if i < n {
+					i++ // skip '>'
+				}
 				tokens = append(tokens, content[start:i])
 			}
 
@@ -743,7 +745,9 @@ func tokenizePDF(content string) []string {
 						for i < n && content[i] != '>' {
 							i++
 						}
-						i++
+						if i < n {
+							i++ // skip '>'
+						}
 					}
 				default:
 					i++
